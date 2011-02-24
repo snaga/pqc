@@ -1,0 +1,798 @@
+$Header: /cvsroot/pgpool/pgpool/README,v 1.26 2007/09/12 03:54:34 y-asaba Exp $
+
+pgpool version 3.4.1 README
+
+1. What is pgpool
+
+   pgpool is a connection server for PostgreSQL. pgpool runs between
+   PostgreSQL's clients(front ends) and servers(back ends). A
+   PostgreSQL client can connect to pgpool as if it were a standard
+   PostgreSQL server.
+
+   pgpool caches the connection to PostgreSQL server to reduce the
+   overhead to establish the connection to it.
+
+   Also, pgpool could use two PostgreSQL servers for fail over. If the
+   first server goes down, pgpool will automatically switch to the
+   secondary server.
+
+   Moreover, pgpool supports scheduled switch over. See
+   "10. Switchover" for more details.
+
+1.1 About replication facility of pgpool
+
+   pgpool could be used as a replication server. This allows real-time
+   backuping of the database to avoid disk failures. pgpool sends
+   exactly the same updating queries to each PostgreSQL servers to
+   accomplish replication. So pgpool can be regarded as a "synchronous
+   replication server".  Currently pgpool supports up to 2 PostgreSQL
+   servers.
+
+   Please note that some sort of quries such as random functions, OID,
+   XID, timestamp may not be replicated in exactly same value among
+   two servers. This is because qury results for these are local to
+   each PostgreSQL server.
+
+   If you want to use SERIAL data type, "insert_lock" might help
+   you. See "insert_lock" in "6. Setting up pgpool.conf" for more
+   details.
+
+   When one of PostgreSQL server goes down, pgpool tries to continue
+   serverce with live server. This is called "degeneration mode".
+   When you want to come back to the replication mode, please make
+   sure that the DB contens matches among two servers. The best way is
+   shutdown the live server and do a physical copy using rsync from
+   the live server to the dead server. Once the DB contents match you
+   start the two postmaster then restart pgpool.
+
+   While pgpool is in the replication mode, SELECT queries are sent to
+   the master node only if "replicate_select" is false. If the load
+   balancing is enabled, SELECT's are sent to randomly chosen node. If
+   you need to replicate a SELECT query which has a side effect of
+   updaing some data, append the following comment at the beginning of
+   the query.
+
+      /*REPLICATION*/ SELCT ...
+
+   Note that queries that begin with either "SELECT nextval" or
+   "SELECT setval" are automatically replicated. If "replicate_select"
+   is true, SELECTs are replicated.
+
+1.2 Avoiding deadlocks
+
+   pgpool could send a query to the "master" server then send to
+   "secondary" server before master completes the query. This could
+   improve performace, there's a risk of deadlock however. To balance
+   the performace and risk, pgpool could operate in two modes.
+
+   1) "restrict" mode
+
+   In this mode, pgpool wait for the completion of the master query
+   before sending a query to the secondary server. This is the safest
+   and default operating mode for pgpool.
+
+   2) using /*STRICT*/ keyword
+
+   To achieve best performance, you could turn off the strict mode by
+   setting off to "pgpool_restrict" directive. To avoid deadlock, you
+   could insert a special keyword /*STRICT*/ in the beginning of each
+   deadlock-possible quries. Here is an example:
+
+   /*STRICT*/ LOCK TABLE t1;
+
+1.3 what happens if a deadlock ocuurs?
+
+   Since deadlocks mentioned above cannot be detected by PostgreSQL
+   itself, pgpool will abort the session if master or secondary does
+   not respond within certain period. The period can be changed by
+   setting replication_timeout directive.
+
+1.4 about load balancing mode
+
+   If replication is enabled, you can enjoy the load balancing
+   capability of pgpool by enabling load_balance_mode in
+   pgpool.conf. If conditions below are all meet, SELECT queries are
+   distributed among the master and the slave server in random manner,
+   which will boost performance:
+
+   1) protocol version is V3. this means the backend must be
+      PostgreSQL 7.4 or later.
+
+   2) the query begins with "SELECT" or "select" (case is ignored). no
+      space is allowed before "SELECT".
+
+   3) SELECT query is not in a transatcion block.
+
+   Please note that a SELECT may modify databases by calling a
+   updatable function. In this case you should NOT use the load
+   balancing. Othewise pgpool will fail due to the contents difference
+   between the master and the secondary database. You can avoid the
+   load balancing by putting spaces or comments in the begining of the
+   query.
+
+   BTW, since the regression test includes such a SELECT (for example
+   "SELECT 'one' AS one, nextval('insert_seq');" in the constraints
+   test), the regression test will fail if the load balancing mode is
+   enabled.
+
+2. Advantages of pgpool
+
+   There are some connection pool servers other than pgpool. This
+   section explains why you should use pgpool:
+
+   1) you do not need to modify your applications
+
+   There are some connection pool servers which require special
+   API(Application Program Interface) to play with them. Since pgpool
+   looks like PostgreSQL server from the client's point of view,
+   existing PostgreSQL applications can be used without any
+   modifications.
+
+   2) any programming languages can be used
+
+   Since pgpool is not an API, applications written in any languages
+   including PHP, Perl and Java can be used.
+
+   3) employing prefork architecture
+
+   pgpool employing prefork architecture, meaning no need to start up
+   process for each connection from its clients, gives better
+   performance.
+
+   4) resource usage control
+
+   pgpool can limit number of connections to PostgreSQL server. Users
+   could avoid too much load of PostgreSQL by using pgpool especially
+   under Web application environment.
+
+   5) fail over
+
+   pgpool has a functionality so called "fail over". If the first
+   server goes down, pgpool will automatically switch to the secondary
+   server.
+
+   6) replication
+
+   pgpool can be used as a replication server.
+
+   7) load balancing
+
+   SELECT statement can be distributed among servers to gain more performance.
+
+3. Disadvantage of pgpool
+
+   1) overhead
+
+   Any access to PostgreSQL must go through pgpool, which means some
+       overhead is added to each database access. In my testing using
+       pgbench shows 7 to 15% performance penalty. This number may
+       vary for each testing environment though.
+
+   2) not all libpq protocols are supported
+
+   currently following protocols are not supported:
+
+   o any authentication methods except "trust", "clear text password",
+     "pam" (replication or master/slave mode)
+
+   o any authentication methods except "trust", "clear text password",
+     "crypt", "md5", "pam" (non replication mode)
+
+   3) no access control to pgpool using pg_hba.conf
+
+   Any client can connect to pgpool. If this is your concern, you
+   could limit access by using another software such as iptables.
+
+4. supported environments
+
+   pgpool supports libpq protocol version 2(employed by PostgreSQL 6.4
+   to 7.3). If you are going to use with PostgreSQL 7.2 or earlier,
+   you need to modify following line in pgpool.conf.
+
+   7.1 or earlier:
+   reset_query_list = 'ABORT'
+
+   7.2.x:
+   reset_query_list = 'ABORT, RESET ALL'
+
+   7.3 or later:
+   reset_query_list = 'ABORT, RESET ALL, SET SESSION AUTHORIZATION DEFAULT'
+   (currently the default value in pgpool.conf. so you don't need to
+   change it)
+
+   Here are small lists from users where pgpool is running:
+
+   Vine Linux 4.0 (kernel 2.6.16-0vl166)/PostgreSQL 8.2.1
+   Vine Linux 3.2 (kernel 2.4.31-0vl1.10)/PostgreSQL 8.1.1
+   Vine Linux 2.6r4 (kernel 2.4.22-0vl2.12)/PostgreSQL 8.1.0
+   Vine Linux 2.6r4 (kernel 2.4.22-0vl2.12)/PostgreSQL 8.0.3
+   Vine Linux 2.6r4 (kernel 2.4.22-0vl2.12)/PostgreSQL 8.0
+   Vine Linux 2.6r4 (kernel 2.4.22-0vl2.12)/PostgreSQL 7.4.5
+   Vine Linux 2.6r4 (kernel 2.4.22-0vl2.12)/PostgreSQL 7.4.3
+   Vine Linux 2.6r4 (kernel 2.4.22-0vl2.12)/PostgreSQL 7.4.2
+   Vine Linux 2.6r4 (kernel 2.4.22-0vl2.12)/PostgreSQL 7.3.7
+   Vine Linux 2.6r4 (kernel 2.4.22-0vl2.12)/PostgreSQL 7.3.6
+   Vine Linux 2.6r3 (kernel 2.4.22-0vl2.8)/PostgreSQL 7.4.2
+   Vine Linux 2.6r3 (kernel 2.4.22-0vl2.8)/PostgreSQL 7.3.6
+   Vine Linux 2.6CR (kernel 2.4.20-0vl29.1)/PostgreSQL 7.3.4
+   RedHat Linux 9.0 (kernel 2.4.20)/PostgreSQL 7.3.6
+   RedHat Linux 8.0 (kernel 2.4.18-14)/PostgreSQL 7.3.2
+   RedHat Linux 6.2 (kernel 2.2.24)/PostgreSQL 7.2.1
+   FreeBSD 5.2.1-RELEASE(AMD64)/PostgreSQL 7.4.3
+   FreeBSD 5.2.1-RELEASE/PostgreSQL 7.3?
+   FreeBSD 4.7-RELEASE/PostgreSQL 7.2.4 
+   FreeBSD 4.2-RELEASE/PostgreSQL 7.3.2
+   Sparc/Solaris8/PostgreSQL 7.3
+   Sparc/Solaris8/PostgreSQL 7.4.3
+
+5. How to install pgpool
+
+      ./configure
+      make
+      make install
+
+      of course "make" should be read as "gmake" if you are using
+      FreeBSD or Solaris.
+
+      Default installation directories are:
+
+      /usr/local/bin/pgpool			pgpool executable
+      /usr/local/etc/pgpool.conf.sample		example configuration file
+      /usr/local/etc/pool_hba.conf.sample	example HBA configuration file
+
+      You could change the installation directory by giving --prefix
+      option to configure:
+      
+      configure --prefix=path... 
+
+6. Setting up pgpool.conf
+
+   pgpool.conf is the configuration file for pgpool.
+
+   Copy pgpool.conf.sample as pgpool.conf and change it if necessary.
+
+   Here is a explanation of pgpool.conf's grammar.
+
+   1) configuration variables can be set by:
+
+      item = value
+
+      pair.
+
+   2) if the value is a numeric, just write numerics. If the value is
+      a string, you need to quote using single quote pair. example:
+      
+      'foo'
+
+   3) empty lines are ignored
+
+   4) lines starting with # are ignored.
+
+
+   Here is a list of existing items:
+
+   listen_addresses
+
+   Specifies the addresses to listen on for TCP/IP connections.  Set
+   to '*' for all configured IP interfaces, '' for no TCP/IP
+   connections, or else to a specific IP address or host name.  The
+   default is 'localhost'.  Note that connections via UNIX domain
+   sockets are always allowed.
+
+   (For compatibility with earlier versions of pgpool,
+   allow_inet_domain_socket = 1 means listen_addresses = '*' and
+   allow_inet_domain_socket = 0 means listen_addresses = ''.)
+
+   port
+
+   the port number where pgpool is running on. Default value is 9999.
+
+   backend_host_name
+
+   the real PostgreSQL server name pgpool could connect. Default
+   value is '' (empty string), which means pgpool will connect via
+   UNIX domain sockets. Any string other than '' is considered as a
+   host name where the PostgreSQL server is running. In this case the
+   pg_hba.conf file must be properly set so that pgpool could connect
+   to.
+
+   backend_port
+
+   the port number where real PostgreSQL server is running on. Default
+   value is 5432.
+
+   secondary_backend_host_name
+
+   if you are going to use fail over or replication functionality of
+   pgpool, you need to set the hostname or ''. Default value is ''.
+
+   secondary_backend_port
+
+   if you are going to use fail over or replication functionality of
+   pgpool, you need to set the port number where PostgreSQL is running
+   on. Default value is 0, which means the fail over functionality is
+   disabled.
+
+   num_init_children
+
+   number of pgpool process initially forked. Default value is 32.
+
+   max_pool
+
+   number of connection pools each pgpool server process are keeping.
+   pgpool will make a new connection if there's no user name and
+   database name pair yet. Thus it is recommended that max_pool
+   exceeds the number of such that possible pairs. If it exceeds, the
+   oldest connection is discarded and the new connection uses the
+   slot. The default value is 4.
+
+   note that the total number of connections to the PostgreSQL server
+   can be calculated by following:
+
+   num_init_children*max_pool
+
+   child_life_time
+
+   Life of a idle child process in seconds. This will prevent unwanted
+   memory leaks or other problems. Default is 300. Set it to 0
+   disables this feature.
+
+   connection_life_time
+
+   life time for each idle connection in seconds. 0 means the life
+   time is forever. The default value is 0.
+
+   child_max_connections
+
+   if child_max_connections connections were received, child exits. 0
+   means no exit. The default value is 0.
+
+   logdir
+
+   the directory name to store pgpool's log files. Currently only a
+   file named pgpool.pid(has pgpool's process id) is stored. The
+   default value for logdir is '/tmp'.
+
+   replication_mode
+
+   set this true if you are going to use replication
+   functionality. Default is false.
+
+   replication_strict
+
+   If true, pgpool will wait for the completion of the master query
+   before sending a query to the secondary server. This is the safest
+   and default operating mode for pgpool. Default is true.
+
+   replication_timeout
+
+   In non strict replication mode, there will be a chance of
+   deadlock. pgpool will abort the session if master or secondary does
+   not respond within this milli seconds. if set to 0, timeout is
+   disabled.
+
+   load_balance_mode
+
+   Perform load balancing for SELECT. Default is false.
+
+   weight_master
+   weight_secondary
+
+   load balance weight for master and secondary. actual weight is
+   calculated by weight_master:weight_secondary. For example both
+
+   weight_master = 10 and weight_secondary = 5
+   weight_master = 4 and weight_secondary = 2
+
+   are regarded as master has double the weight comparing with
+   secondary.  master and secondary have same weight in the default.
+
+   replication_stop_on_mismatch
+
+   Stop replication mode on data mismatch between master and
+   secondary. Default is false.
+
+   replicate_select
+
+   Replicate SELECTs. Default is false.
+
+   reset_query_list
+
+   semicolon separated SQL commands to be issued at the end of
+   session. Default is as following:
+
+   reset_query_list = 'ABORT; RESET ALL; SET SESSION AUTHORIZATION DEFAULT'
+
+   You may add you own SQL commands to the list. Please note that
+   above all queries may not be accepted by all PostgreSQL
+   versions(see "4. supported environmets" for more details).
+
+   Note that "ABORT" will not be issued if the backend is 7.4 or later
+   and the session is not in a transaction block.
+
+   print_timestamp
+
+   If true timestamp is added to each log line. Default value is true.
+
+   master_slave_mode
+
+   Run in master/slave mode. See 14 for more details. Default value is
+   false. This mode is not compatible with replication_mode.
+
+   connection_cache
+
+   If true, cache connections to PostgreSQL. Default value is true.
+
+   health_check_timeout
+
+   pgpool does "health check" periodically to detect PostgreSQL
+   servers down, network communication problems or as such. If
+   something is going wrong, pgpool will automatically run into fail
+   over or degeneration mode.
+
+   This parameter specifies the timeout value in seconds to avoid hung
+   up in the health checking. The default is 20. 0 means no timeout.
+
+   The health checking actually connects to PostgreSQL as if it's an
+   ordinaly PostgreSQL client. Thus you may need to increase the
+   max_connections parameter of PostgreSQL.
+
+   health_check_period
+
+   Specifies the interval for next health checking. 0 means no health
+   checking. The default is 0(i.e. no health checking).
+
+   health_check_user
+
+   PostgreSQL user name for the health checking.
+
+   insert_lock
+
+   If you replicate a table having SERIAL data type column, sometimes
+   the serial value does not match between servers. You can avoid the
+   problem by using a table lock (with a performance penalty due to
+   less currency in transactions). For this you need to rewrite you
+   query:
+
+   INSERT INTO ....
+
+   to:
+
+   BEGIN;
+   LOCK TABLE ...
+   INSERT INTO ...
+   COMMIT;
+
+   This is painfull. If you turn on insert_lock, pgpool will
+   automatically do the rewriting for you.
+
+   Beaware that pgpool is not smart enough that to do the rewriting
+   only for tables having SERIAL column. To avoid the problem try one
+   of these:
+
+   1) set insert_lock to true and add a /*NO INSERT LOCK*/ comment at
+      the beginning of the query. This will prevent the rewriting.
+
+   2) set insert_lock to false and add a /*INSERT LOCK*/ comment at
+      the beginning of the query. This will do the rewriting for the
+      query only.
+
+   The default value for insert_lock is false.
+
+   Note that turning on insert_lock will make some of the regression
+   test fail. As of PostgreSQL 8.0, transactions, privileges, rules,
+   alter_table fail. The reason of the failure is table locking for
+   views in rule test, and for others erroneous queries abort the
+   transaction *before* pgpool issues the table lock statement.
+
+   ignore_leading_white_space
+
+   If true, ignore leading white spaces of each query while pgpool
+   judges if the query is a SELECT so that it can be load
+   balnced. This is usefull for certain APIs such as DBI/DBD which is
+   know as adding an extra leading white space.
+
+   log_statement
+
+   If true, print all statements to the log.  Like the log_statement option
+   to PostgreSQL, this allows for observing queries without engaging in full
+   debugging.
+
+   log_hostname
+
+   If true, ps command status will show the client's hostname instead
+   of an IP address. Also, if log_connections is enabled, hostname will
+   be logged.
+
+   log_connections
+
+   If true, all incoming connections will be printed to the log.
+
+   enable_pool_hba
+
+   If true, use pool_hba.conf for client authentication. See
+   "7. Setting up pool_hba.conf for client authentication".
+
+7. Setting up pool_hba.conf for client authentication (HBA)
+
+  Just like pg_hba.conf with PostgreSQL, pgpool supports a similar
+  client authentication function using a configuration file called 
+  "pool_hba.conf".
+
+  When you install pgpool, pool_hba.conf.sample will be installed in
+  "/usr/local/etc", which is the default directory for configuration
+  files.
+
+  Copy pool_hba.conf.sample as pool_hba.conf and edit it if necessary.
+  By default, pool_hba authentication is enabled. See "6. Setting up
+  pgpool.conf" for more detail.
+
+  The format of pool_hba.conf file follows very closely to pg_hba.conf.
+
+    local      DATABASE  USER  METHOD  [OPTION]
+    host       DATABASE  USER  CIDR-ADDRESS  METHOD  [OPTION]
+
+  See "pool_hba.conf.sample" for details of each field.
+
+  Here are the limitations of pool_hba.
+
+  * "hostssl" connection type is not supported
+
+    "hostssl" is invalid since pgpool currently does not support SSL
+    connections.
+
+  * "samegroup" for DATABASE field is not supported
+
+    Since pgpool does not know anything about users in the backend server,
+    database name is simply checked against the entries in the DATABASE
+    field of pool_hba.conf.
+
+  * group names following "+" for USER field is not supported
+
+    This is the same reason as in the "samegroup" described above. A
+    user name is simply checked against the entries in the USER field
+    of pool_hba.conf.
+
+  * IPv6 for IP address/mask is not supported
+
+    pgpool currently does not support IPv6.
+
+  * Only "trust", "reject" and "pam" for METHOD field are supported
+
+    Again, this is the same reason as in the "samegroup" described above.
+    pgpool does not hold user/password information.
+  
+  Note that everything described in this section is about a client authen-
+  tication between a client and pgpool; a client still have to go through
+  an authentication process with PostgreSQL. As far as pool_hba is concerned,
+  it does not matter if a user name and/or database name given by a client
+  (i.e. psql -U testuser testdb) really exist in the backend. pool_hba only
+  cares if a match in the pool_hba.conf is found or not.
+
+  PAM authenticaion is supported using user information on the host where
+  pgpool is executed. To enable PAM support in pgpool, specify "--with-pam"
+  option to configure:
+
+    configure --with-pam
+
+  To enable PAM authentication, you need to create a
+  service-configuration file for pgpool in the system's PAM
+  configuration directory (which is usually at "/etc/pam.d"). A sample
+  service-configuration file is installed as "share/pgpool.pam" under
+  the install directory.
+
+8. Starting pgpool
+
+   The simplist way to start pgpool is:
+
+   $ pgpool
+
+   pgpool will load /usr/local/etc/pgpool.conf.
+
+   available options for pgpool are:
+
+   -f path
+
+   the path to the configuration file.
+
+   -a path
+
+   the path to the pool_hba configuration file.
+
+   -n
+
+   do not start as daemon. Error messages go to stdout or stderr. Thus
+   you could play with utilities such as logger and rotatelogs. You
+   need to run in background explicitly if you use this option.
+
+   -d
+
+   lots of debugging messages come out
+
+   -h
+
+   print the help message and quit
+
+9. Stopping pgpool
+
+   You can stop pgpool by using "stop" option:
+
+   $ pgpool [-f config_file] -m {s[mart]|f[ast]|i[mmediate]} stop
+
+   If there's any live connection from frontend, it will wait until
+   the connection terminated.
+
+   To force it to be stopped, try:
+
+   $ pgpool -m f[ast] stop
+
+   or
+
+   $ pgpool -m i[mmediate] stop
+
+10. switchover
+
+   For maintenance purpose, scheduled switching or degeneration is
+   supported.
+
+   To send both reads and writes only to the secondary:
+
+   $ pgpool [-f config_file] switch
+
+   To switch to using only the master: 
+
+   $ pgpool [-f config_file] -s secondary switch
+
+   If there's only one PostgreSQL server, pgpool switch will just
+   restart pgpool child processes.
+
+11. how to get logging
+
+   You could save messages from pgpool to a file by starting it with
+   -n option:
+
+   pgpool -n >& /tmp/pgpool.log &
+
+   If you prefer to log to syslog, do like this:
+
+   pgpool -n 2>&1 |logger -t pgpool -p local0.info&
+
+12. getting internal status of pgpool
+
+    You could use psql or whatever to obtain the internal status of
+    pgpool by issuing a special SQL command:
+
+    psql -p 9999 -c 'show pool_status' template1
+
+             item             |                        value                         |                              description
+------------------------------+------------------------------------------------------+------------------------------------------------------------------------
+ listen_addresses             | *                                                    | host name(s) or IP address(es) to listen to
+ port                         | 9998                                                 | pgpool accepting port number
+ socket_dir                   | /tmp                                                 | pgpool socket directory
+ backend_host_name            |                                                      | master backend host name
+ backend_port                 | 5432                                                 | master backend port number
+ secondary_backend_host_name  |                                                      | secondary backend host name
+ secondary_backend_port       | 5433                                                 | secondary backend port number
+ num_init_children            | 32                                                   | # of children initially pre-forked
+ child_life_time              | 0                                                    | if idle for this seconds, child exits
+ connection_life_time         | 0                                                    | if idle for this seconds, connection closes
+ child_max_connections        | 0                                                    | if max_connections received, chile exits
+ max_pool                     | 2                                                    | max # of connection pool per child
+ logdir                       | /tmp                                                 | logging directory
+ backend_socket_dir           | /tmp                                                 | Unix domain socket directory for the PostgreSQL server
+ replication_mode             | 1                                                    | non 0 if operating in replication mode
+ replication_strict           | 1                                                    | non 0 if operating in strict mode
+ replication_timeout          | 5000                                                 | if secondary does not respond in this milli seconds, abort the session
+ load_balance_mode            | 0                                                    | non 0 if operating in load balancing mode
+ weight_master                | 1.000000                                             | weight of master
+ weight_secondary             | 1.000000                                             | weight of secondary
+ replication_stop_on_mismatch | 0                                                    | stop replication mode on fatal error
+ reset_query_list             | ABORT; RESET ALL; SET SESSION AUTHORIZATION DEFAULT; | queries issued at the end of session
+ print_timestamp              | 1                                                    | if true print time stamp to each log line
+ master_slave_mode            | 0                                                    | if true, operate in master/slave mode
+ connection_cache             | 1                                                    | if true, cache connection pool
+ health_check_timeout         | 5                                                    | health check timeout
+ health_check_period          | 0                                                    | health check period
+ health_check_user            | t-ishii                                              | health check user
+ insert_lock                  | 1                                                    | insert lock
+ ignore_leading_white_space   | 0                                                    | ignore leading white spaces
+ current_backend_host_name    |                                                      | current master host name
+ current_backend_port         | 5432                                                 | current master port #
+ replication_enabled          | 1                                                    | non 0 if actually operating in replication mode
+ master_slave_enabled         | 0                                                    | non 0 if actually operating in master/slave
+ num_reset_queries            | 3                                                    | number of queries in reset_query_list
+ log_statement                | 0                                                    | if true, print all statements to the log
+ log_connections              | 1                                                    | if true, print incoming connections to the log
+ log_hostname                 | 0                                                    | if true, resolve hostname for ps and log print
+ enable_pool_hba              | 1                                                    | if true, use pool_hba.conf for client authentication
+ server_status                | master( on 5432) up secondary( on 5433) up           | server status
+(39 rows)
+
+By using contrib/dblink, you can see part of the result of
+show_pool_status someting like:
+
+test=# SELECT * FROM dblink('port=9999 dbname=test', 'show pool_status')
+	AS c1(pname text, val text) WHERE pname = 'port';
+ pname | val  
+-------+------
+ port  | 9999
+(1 row)
+
+13. Playing with regression test
+
+   $ cd /usr/local/src/postgresql-7.4.5/src/test/regress
+   $ make all
+   $ ./pg_regress --schedule=parallel_schedule --port=9999
+
+14. Playing with benchmarking
+
+   Here is a brief explanation how to play with benchmarking using pgbench/PHP/ab.
+
+   Initialize the pgbench database.
+
+   $ pgbench -i test
+  
+   Prepare PHP script. Here is an example PHP script.
+
+   <?php
+    ini_set("track_errors", "1");
+    define_syslog_variables();
+
+    $con = pg_pconnect("dbname=test user=postgres port=9999");
+    if ($con == FALSE) {
+      syslog(LOG_ERR, "could not connect $php_errormsg");
+      trigger_error("Could not connect to DB", E_USER_ERROR);
+      exit;
+    }
+    $aid = rand(1,10000);
+    pg_query($con, "SELECT * FROM accounts WHERE aid = $aid");
+    pg_close($con);
+  ?>
+
+  run ab.
+
+  $ /usr/local/apache/bin/ab -c 100 -n 1000 "http://localhost/bench.php"
+
+15. master/slave mode
+
+  master/slave mode is designed to cope with master/slave replication
+  softwares, such as Slony-I. To enable this mode, you need to set
+  secondary host, and set true to master_slave_mode and
+  load_balance_mode. Depending on the kind of qureries, pgpool
+  operates as follows:
+
+  1) if all below are satisfies, quries sent to both master and
+     secondary with load balance manner.
+
+     - PostgreSQL 7.4 or later
+     - the query begins with "SELECT"(case insensitive)
+     - not in a transaction block
+
+  2) in all other case, quries are sent to only master
+
+16. Multiple simultaneous instances of pgpool
+
+  In order to run multiple instances of pgpool on the same server  
+  simultaneously (in order to have two separate, non-conflicting  
+  connection pools, for instance), create a different configuration  
+  file for each instance of pgpool you wish to run.
+
+  Then start each instance of pgpool by using the -f flag to point it  
+  to the correct configuration file. For instance:
+
+  pgpool -f /usr/local/etc/pgpool.1.conf
+  pgpool -f /usr/local/etc/pgpool.2.conf
+
+  In order for the separate instances to run without conflict, make  
+  sure that the following parameters are different in the configuration  
+  files:
+
+  port
+  logdir (which currently controls where pgpool drops a pid file)
+
+  Note that each instance of pgpool should then be stopped by  
+  specifying the -f flag, too. For instance:
+
+  pgpool -f /usr/local/etc/pgpool.1.conf -m smart stop
+
+  This would stop the first instance of pgpool running in this example.

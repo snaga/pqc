@@ -1,0 +1,1038 @@
+$Header: /cvsroot/pgpool/pgpool/README.euc_jp,v 1.26 2007/09/12 03:54:34 y-asaba Exp $
+
+pgpool version 3.4.1(lainihi) README
+
+1. pgpoolとは
+
+   pgpoolは，PostgreSQL専用のいわゆる「コネクションプール」サーバで， 
+   PostgreSQLクライアントとPostgreSQLサーバの間で両者の仲立ちをします．
+   pgpoolを利用することによって，PostgreSQLサーバへの接続オーバヘッド
+   を低減でき，システム全体のスループットを向上させることができます．
+
+   PostgreSQLのクライアントがpgpoolに接続すると，初回はPostgreSQLへの
+   接続がpgpoolから確立されます．クライアントが終了してもPostreSQLへの
+   接続は切断されることなく残り，次回の同じユーザ，データベースで
+   pgpoolへの接続があったときにはこのPostgreSQLへの接続が再利用されま
+   す．
+
+   pgpoolには障害時に「フェイルオーバ」(コネクションプールモード時)あ
+   るいは「縮退運転」（レプリケーションモード時）の機能があるので，シ
+   ステムのダウンタイムを最小限に押さえることができます．
+
+   なお，フェイルオーバや縮退運転は何か障害が起きたことをトリガにして
+   起動されますが，メインテナンスなどのために意図的にフェイルオーバや
+   縮退運転モードに移行することもできます．詳細は「10. スイッチオーバ」
+   をご覧下さい．
+
+1.1 レプリケーションについて
+
+   更にpgpoolは「レプリケーション」も可能です．レプリケーションを使用
+   することにより，物理的に2台のディスクにリアルタイムでハードディスク
+   のバックアップを取ることができ，片方にディスク障害が発生しても運用
+   を継続することができます．pgpoolのレプリケーションは同じ更新系の問
+   い合わせを2台のサーバに送信することによって行いますので，いわゆる同
+   期レプリケーションの一種ということになります．なお，今のところ，レ
+   プリケーションは2台のみで，3台以上のレプリケーションはできません．
+
+   このような実装ですので，pgpoolでは同じ問い合わせを送っても異なる結
+   果を返すようなデータ，たとえば乱数やトランザクションID，OID，SERIAL，
+   シーケンス，CURRENT_TIMETSTAMPのようなものに関してはレプリケーショ
+   ンはしますが，2台のホストでまったく同じ値がコピーされる保証はありま
+   せん．
+
+   ただし，SERIAL型については，後述の"insert_lock"を使うことによって対
+   応可能です．詳細は「6. pgpoolの設定方法」のinsert_lockの項を参照し
+   てください．
+
+   レプリケーション中に障害が発生すると，自動的に縮退運転を行います．
+   例を示します．今，
+
+   masterサーバ(backend_host_name, backend_portで指定)
+   secondaryサーバ(secondary_backend_host_name, secondary_backend_portで指定)
+
+   の2台でレプリケーションを行っていたとします．
+
+   1) 正常時
+
+      master, secondaryに同一のデータがレプリケーションされる．
+
+   2) masterに障害が発生
+
+      masterを切り離してsecondaryのみで運用を継続
+
+   3) secondaryに障害が発生
+
+      secondaryを切り離してmasterのみで運用を継続
+
+   4) masterとsecondaryのデータ不一致を検出
+
+      pgpoolは全部ではありませんが，要所要所でmasterのsecondaryのデー
+      タが一致しているかどうかをチェックしています．たとえば，同じテー
+      ブルなのに列数が異なるようなケースは，異常と見なされます．このよ
+      うな異常が検出されると，secondaryのみで運用を継続します．
+
+   縮退運転に入ると以後masterとsecondaryのデータは一致しない状態になる
+   可能性があります．再度レプリケーション運転に入る前に，一旦両系を停
+   止し，rsyncなどを使って手動でデータベースクラスタの状態を一致させて
+   ください．この際，障害の状況によっては必ずしもmaster側が最新とは限
+   らないので注意してください．master，secondaryのどちらで縮退運転をし
+   ているかは，pgpoolにpsqlなどから"show pool_status"コマンドを投げる
+   ことで確認できます(詳細後述)．
+
+
+   レプリケーション時の SELECT については、replicate_select の値によっ
+   て挙動が異なります。false の場合はマスタにのみ送信します。ただし、
+   負荷分散を設定している場合はどちらかにランダムで送信します。詳細は
+   「1.4 負荷分散(load balance)について」をご覧ください。副作用を伴な
+   う関数呼び出しがある場合は、
+
+      /*REPLICATION*/ SELECT ...
+
+   と、SELECT の前にコメントを付けてください。なお、SELECT nextval も
+   しくは SELECT setval で始まるクエリは自動的にレプリケーションさせま
+   す。true の場合はすべての SELECT をレプリケーションさせます。
+
+1.2 レプリケーションにおける制限事項
+
+   まったく同じ問い合わせを2つのサーバに発行することによってレプリケー
+   ションを行うpgpoolでは，単体のPostgreSQLでは発生しないデッドロック
+   状態が起こり得ます．その理由は，pgpoolでは，問い合わせを
+
+   1) 問い合わせのリクエストを master, secondary の順に投げる
+
+   2) 結果の待ち合わせを master, secondary の順に行う
+
+   というように処理するからです．デッドロックの例を示します．ここでは，
+
+   BEGIN;
+   LOCK TABLE t1;
+   END;
+
+   という単純なトランザクションを考えます．以下の図では，begin, endは
+   省略しています．また，2つのセッションsession 0とsession 1が進行して
+   いるものとします．
+
+	    master		       secondary
+   session 0	session 1	session 0   session 1
+   ------------------------------------------------------
+   lock	
+		lock
+					     lock
+				lock
+   ------------------------------------------------------
+
+   session1のmasterはsession0のmasterを待ち続けますが，一方secondaryに
+   おいては，session1が先にロックを獲得したため，session0がsession1を
+   待ち続けています．このようにしてお互いにお互いを待ち続けるデッドロッ
+   ク状態が発生します．
+
+   pgpoolでは，この問題に対処するため，以下の2つの方法を用意しています．
+
+   1) pgpool.confのreplication_strictをtrueにする
+
+      こうすると，常にsecondaryはmasterの問い合わせ処理が終わってから
+      問い合わせを処理するようになります．デッドロックが発生する恐れは
+      なくなりますが，masterとsecondaryの並列処理ができなくなるため，
+      パフォーマンスが落ちる可能性がありますが，もっとも安全な方法です．
+      pgpoolはデフォルトでこのモードで動作します．
+
+      なお，ある問合わせのみstrictモードにしたくない場合は，
+      /*NO STRICT*/コメントを問合わせの先頭にいれてください．
+
+   2) デッドロックが発生する可能性のある問い合わせの先頭に特別なキーワー
+      ド「/*STRICT*/」を入れる
+
+      たとえば上の例で言うと
+
+      /*STRICT*/ LOCK TABLE t1;
+
+      とします．こうすると，この問い合わせだけはmasterとsecondaryが並
+      列処理しなくなるので，デッドロックが発生しません．/*STRICT*/が記
+      入されていない他の問い合わせは並列処理されるので，効率が良くなり
+      ます．
+
+      なお，PostgreSQLでは，/*から*/まではコメントとして扱われるので，
+      DB処理に影響はありません．
+
+1.3 replication_timeoutについて
+
+   万が一デッドロックが発生したときに備え，replication_timeoutを設定す
+   ることができます．単位はミリ秒(1/1000秒)です．もしmasterの処理が終
+   わってからsecondaryがreplication_timeout以内に応答を返さない場合は，
+   該当セッションを強制終了することによってデッドロック状態を解消しま
+   す．
+
+   なお，masterに比べ，secondaryの性能が著しく劣る場合にはsecondaryの
+   応答が遅れ，デッドロックではないのにタイムアウトになることがありま
+   す．この場合は適当にreplication_timeoutを大きくするか，
+   replication_strictをtrue にします．
+
+   注意: replication_strictがtrueの場合にはこのパラメータは無視されま
+   す．
+
+1.4 負荷分散(load balance)について
+
+   レプリケーションが有効な場合，pgpool.confの"load_balance_mode"を
+   trueに設定することによりSELECT文の負荷分散が可能です．以下の条件の
+   もとでランダムにマスタとセカンダリにSELECT文が発行され，検索性能の
+   向上が期待できます．
+
+   1) プロトコルバージョンがV3であること．すなわちバックエンドが
+      PostgreSQL 7.4以後であること
+
+   2) SQL文が正確に行頭からSELECT(あるいはselect)で始まっていること(た
+      だし、SELECT nextval と SELECT setval の場合は除く)
+
+   3) SELECT文が明示的なトランザクションブロック内で実行されていないこ
+      と
+
+   なお，当然のことながらSELECT FOR UPDATEや，更新を伴う関数を呼び出す
+   ような副作用のあるSELECT文を使用している場合は問題が起きます．この
+   ような場合はload_balance_mode"をfalseにするか，SELECT文の行頭にスペー
+   スや/*NO LOAD BALANCE*/のようなコメントを挿入して負荷分散されないよ
+   うにしてください．
+
+   ちなみに，regression testにはそのようなSELECT文が含まれているため
+   (たとえばconstraintsテストの「SELECT 'one' AS one,
+   nextval('insert_seq');」)ロードバランスモードが有効になっていると
+   regression testが通りません．
+
+2. pgpoolのメリット
+
+   世の中にはpgpool以外にもデータベース用のコネクションプールサーバが
+   存在しますが，それらと比較した場合のpgpoolのメリットを説明します．
+
+   (1) アプリケーションの変更の必要がありません
+
+       コネクションプール用のソフトには専用の特別なAPI(アプリケーショ
+       ンプログラムインターフェイス)を経由しないと利用できないものもあ
+       りますが，pgpoolはクライアントから見ると普通のPostgreSQLサーバ
+       に見えるため，そのようなAPIを使用する必要がありません．今まで
+       PostgreSQLを使っていたアプリケーションは，接続先のポート番号や
+       ホストを変更するだけですぐにpgpoolが利用できるようになります．
+       (ただし，いくつか制限事項があります)
+
+   (2) どの言語でも使えます
+
+        pgpoolはPostgreSQLのクライアントやアプリケーションから見ると普
+	通のPostgreSQLサーバに見えます．したがってPHP, Perl, Javaなど
+	各言語用のPostgreSQL用APIがそのまま使えます．
+
+   (3) prefork型アーキテクチャ
+
+       Apacheなどと同様，あらかじめサーバプロセスをforkしておくアーキ
+       テクチャを採用．コネクション要求の度にサーバプロセスをforkする
+       方式に比べ，オーバヘッドが少なく，応答性が優れています．
+
+   (4) PostgreSQLへの接続数の制限が可能
+
+       PHPからPostgreSQLにアクセスする場合，同時接続数がApacheサーバの
+       プロセス数と等しくなるため，PostgreSQLが過負荷になりがちです．
+       pgpoolではPostgreSQLへの接続数はpreforkしたpgpoolのサーバ数に
+       よって制限されるため，PostgreSQLがもっとも効率良く動作する同時
+       接続数を維持することができます．
+
+   (5) フェイルオーバー機能を装備
+
+       pgpoolには「フェイルオーバー」の機能があります．すなわち，
+       PostgreSQLサーバを2台指定しておき，1台がダウンした際に自動的に2
+       台目のサーバに切り替えることができます．フェイルオーバー機能に
+       より，システムのダウンタイムを最小限に押さえることができます．
+       ただし，2台のPostgreSQLサーバのデータを同期させる機能はありませ
+       んので，必要ならばdbmirrorなどのレプリケーションパッケージを併
+       用してください．
+
+       また，フェイルオーバーの際にはクライアントとのコネクションが切
+       断されます．したがって，フェイルオーバー後はクライアントは再度
+       pgpoolに接続する必要があります．
+
+   (6) レプリケーション機能を装備．ラージオブジェクトのレプリケーショ
+       ンも可能です．
+
+   (7) 負荷分散機能を装備．SELECT文の負荷分散ができます．
+
+3. pgpoolのデメリット
+
+   (1) オーバヘッドがあります
+
+       PostgreSQLに対するアクセスはすべていったんpgpoolを経由するため，
+       その分のオーバヘッドがあります．オーバヘッドの量は条件によって
+       異なるので一概には言えませんが，私がpgbenchで試した限りでは7-
+       15%程度の性能劣化が認められました．
+
+   (2) すべてのlibpqプロトコルがサポートされていません
+
+       現時点では，以下の機能がサポートされていません．
+
+       o trust, clear text password, pam以外の認証方式(レプリケーショ
+        ンモードまたはマスタ/スレーブモード時)
+
+       o trust, clear text password, crypt, md5, pam以外の認証方式(非
+        レプリケーションモード時)
+
+       o pgpoolに対して，pg_hba.confによるアクセス制御はサポートされて
+         いません(pgpoolが接続するPostgreSQLではもちろんpg_hba.confに
+         よるアクセス制御が有効になります)
+
+   (3) pgpool自体にpg_hba.confによるアクセス制限はかかりません
+
+       TCP/IPコネクションを許可している場合(後述の
+       allow_inet_domain_socketが1の場合)，pgpool自体にはどのホストか
+       らでも接続できてしまいます．必要ならばiptablesなどを使ってアク
+       セス制限をかけて下さい(もちろん，pgpoolが接続するPostgreSQLサー
+       バではpg_hba.confによるアクセス制限が有効です)．
+
+   (5) 制限事項
+
+       o レプリケーションにおける制限事項については1.2をご覧下さい．
+
+       o template1, regressionという名前のデータベースはコネクションプー
+         ルの対象になりません．
+
+       o CREATE TEMP TABLEで作成されたテーブルはフロントエンドがセッショ
+         ンを終了しても削除されません．これは，コネクションプールの効
+         果でバックエンドから見るとセッションが継続しているように見え
+         るからです．セッションの終了時に明示的にDROP TABLEするか，ト
+         ランザクションブロックの中でCREATE TEMP TABLE ... ON COMMIT
+         DROPをお使い下さい．
+
+4. pgpoolの稼働環境
+
+   pgpoolは，libpqプロトコルのversion 2(PostgreSQL 6.4-7.3.xで採用)お
+   よびversion 3(PostgreSQL 7.4以降)に対応していますが，セッションの終
+   了時に送出できる問い合わせに違いがあります．PostgreSQLのバージョン
+   に応じて以下のようにpgpool.confを設定してください．
+
+   7.1あるいはそれ以前のバージョン:
+   reset_query_list = 'ABORT'
+
+   7.2.x:
+   reset_query_list = 'ABORT; RESET ALL'
+
+   7.3以降:
+   reset_query_list = 'ABORT; RESET ALL; SET SESSION AUTHORIZATION DEFAULT'
+
+   に変えてください(最後はpgpool.confのデフォルト値なので，実際には変
+   更の必要はありません)．
+
+   version 2プロトコルとversion 3のフロントエンドとバックエンドが混在
+   していても問題ありません．pgpoolはプロトコルバージョンを自動判別し，
+   適切に処理します（ただし，マスタとセカンダリのPostgreSQLのプロトコ
+   ルバージョンは合わせる必要があります）．
+
+   対応するOSは特に制限がありません．以下，動作が確認された環境です．
+
+   Vine Linux 4.0 (kernel 2.6.16-0vl166)/PostgreSQL 8.2.1
+   Vine Linux 3.2 (kernel 2.4.31-0vl1.10)/PostgreSQL 8.1.1
+   Vine Linux 2.6r4 (kernel 2.4.22-0vl2.12)/PostgreSQL 8.1.0
+   Vine Linux 2.6r4 (kernel 2.4.22-0vl2.12)/PostgreSQL 8.0.3
+   Vine Linux 2.6r4 (kernel 2.4.22-0vl2.12)/PostgreSQL 8.0
+   Vine Linux 2.6r4 (kernel 2.4.22-0vl2.12)/PostgreSQL 7.4.5
+   Vine Linux 2.6r4 (kernel 2.4.22-0vl2.12)/PostgreSQL 7.4.3
+   Vine Linux 2.6r4 (kernel 2.4.22-0vl2.12)/PostgreSQL 7.4.2
+   Vine Linux 2.6r4 (kernel 2.4.22-0vl2.12)/PostgreSQL 7.3.7
+   Vine Linux 2.6r4 (kernel 2.4.22-0vl2.12)/PostgreSQL 7.3.6
+   Vine Linux 2.6r3 (kernel 2.4.22-0vl2.8)/PostgreSQL 7.4.2
+   Vine Linux 2.6r3 (kernel 2.4.22-0vl2.8)/PostgreSQL 7.3.6
+   Vine Linux 2.6CR (kernel 2.4.20-0vl29.1)/PostgreSQL 7.3.4
+   RedHat Linux 9.0 (kernel 2.4.20)/PostgreSQL 7.3.6
+   RedHat Linux 8.0 (kernel 2.4.18-14)/PostgreSQL 7.3.2
+   RedHat Linux 6.2 (kernel 2.2.24)/PostgreSQL 7.2.1
+   FreeBSD 5.2.1-RELEASE(AMD64)/PostgreSQL 7.4.3
+   FreeBSD 5.2.1-RELEASE/PostgreSQL 7.3?
+   FreeBSD 4.7-RELEASE/PostgreSQL 7.2.4 
+   FreeBSD 4.2-RELEASE/PostgreSQL 7.3.2
+   Sparc/Solaris8/PostgreSQL 7.3
+   Sparc/Solaris8/PostgreSQL 7.4.3
+
+5. pgpoolのインストール方法
+
+   (1) pgpoolのインストール
+
+      ./configure
+      make
+      make install
+
+      でインストールが完了します(GNU makeが必要なので，FreeBSDなどでは
+      makeをgmakeに読み替えてください)．デフォルトのインストール先は，
+      /usr/local以下で以下のようなファイルがインストールされます．
+
+      /usr/local/bin/pgpool			プログラム本体
+      /usr/local/etc/pgpool.conf.sample		設定ファイルサンプル
+      /usr/local/etc/pool_hba.conf.sample	HBA設定ファイルサンプル
+
+      インストール先を変更する場合は，configure --prefix=path... とし
+      てください．
+
+6. pgpoolの設定方法
+
+   pgpoolの設定パラメータはpgpool.confで設定します．pgpool.conf.sample
+   をpgpool.confにコピーし，設定を行ってください．
+
+   pgpool.confの書式は以下です．
+
+   (1) 設定項目 = 値 のペアで設定を行います．
+
+   (2) 値が数値の場合はそのまま数字を書きますが，文字列の場合は原則と
+       して'(単一引用符)で括ります．例:'foo' 空白が含まれない場合は単
+       一引用符を省略しても構いません．論理値の項目については，true(真)，
+       false(偽)，1(真)，0(偽)で記述します．
+
+   (3) 空白行は無視されます．
+
+   (4) 行の先頭に"#"(シャープ)がある行は無視されます．コメント行として
+       お使い下さい．
+
+   pgpool.confには以下のような設定項目があります．
+
+   listen_address
+
+   TCP/IPコネクションを受け付けるアドレスをホスト名またはIPアドレスで
+   指定します．「*」を指定するとすべてのIPインタフェースからのコネクショ
+   ンを受け付けます．「''」を指定するとTCP/IPコネクションを受け付けま
+   せん．デフォルト値は「localhost」です．
+   
+   UNIXドメインソケット経由のコネクションは常に受け付けます．
+
+   なお，以前のバージョンと互換性を保つため，allow_inet_domain_socket
+   ディレクティブを使用することもできます．
+
+   allow_inet_domain_socket = 1 は， listen_addresses = '*' と同じで，
+   allow_inet_domain_socket = 0 は listen_addresses = '' と同じです．
+
+   port
+
+   pgpoolがコネクションを受け付けるポート番号です．デフォルト値は9999
+   です．
+
+   socket_dir
+
+   pgpoolがコネクションを受け付けるUnix domain socketディレクトリです．
+   デフォルト値は'/tmp'です．
+
+   backend_host_name
+
+   pgpoolが接続するPostgreSQLサーバ(postmaster)が動いているホストの名
+   前(文字列)です．デフォルト値は''で，この場合UNIXドメインソケットを
+   通じて接続を行います．''以外ならばホスト名と見なし，INETドメインソ
+   ケット経由で接続します．この場合，PostgreSQL側ではTCP/IPコネクショ
+   ンを受け付けるようになっていること，またpg_hba.confが適切に設定され
+   ていてpgpoolからの接続を許可するようになっている必要があります
+   （PostgreSQLから見ると，pgpoolはクライアントに見えることを思い出し
+   てください．）．
+
+   backend_port
+
+   PostgreSQLサーバのポート番号です．デフォルト値は5432です．
+
+   backend_socket_dir
+
+   PostgreSQLサーバのUnix domain socketのディレクトリです．デフォルト値は'/tmp'です．
+
+   secondary_backend_host_name
+
+   フェイルオーバー機能またはレプリケーション機能を利用する場合，2台目
+   のPostgreSQLサーバのホスト名を指定します．デフォルト値は''です．
+
+   secondary_backend_port
+
+   フェイルオーバー機能またはレプリケーション機能を利用する場合，2台目
+   のPostgreSQLサーバのポート番号を指定します．0を指定するとフェイルオー
+   バしません．デフォルト値は0です．
+
+   num_init_children
+
+   preforkするpgpoolのサーバプロセスの数です．デフォルト値は32になって
+   います．
+
+   なお，問い合わせのキャンセルを行うと通常のコネクションとは別に新た
+   なコネクションが張られます．したがって，すべてのコネクションが使用
+   中の場合は問い合わせのキャンセルができなくってしまうので，ご注意下
+   さい．問い合わせのキャンセルを必ず保証したい場合は，想定されるコネ
+   クション数の倍の値を設定することをおすすめします．
+
+   max_pool
+
+   pgpoolの各サーバプロセスがキープするPostgreSQLへの最大コネクション
+   数です．pgpoolは，ユーザ名，データベースが同じならばコネクションを
+   再利用しますが，そうでなければ新たにPostgreSQLへのコネクションを確
+   立しようとします．したがって，ここでは想定される[ユーザ名:データベー
+   ス名]のペアの種類の数だけをmax_poolに指定しておく必要があります．も
+   しmax_poolを使いきってしまった場合は一番古いコネクションを切断し，
+   そのスロットが再利用されます．
+
+   max_poolのデフォルト値は4です．
+
+   なお，pgpool全体としては，num_init_children*max_pool 分だけ
+   PostgreSQLへのコネクションが張られる点に注意してください．
+
+   child_life_time
+
+   pgpoolの子プロセスの寿命です．アイドル状態になってから
+   child_life_time秒経過すると，一旦終了して新しいプロセスを起動します．
+   メモリーリークその他の障害に備えた予防措置です．child_life_timeのデ
+   フォルト値は300秒，すなわち5分です．0を指定するとこの機能は働きませ
+   ん（すなわち起動しっ放し）．なお，まだ一度もコネクションを
+   受け付けていないプロセスにはchild_life_timeは適用されません．
+
+   connection_life_time
+
+   コネクションプール中のコネクションの有効期間を秒単位で指定します．0
+   を指定すると有効期間は無限になります．connection_life_timeのデフォ
+   ルト値は0です．
+
+   child_max_connections
+
+   各pgpool子プロセスへの接続回数がこの設定値を超えると、その子プロセ
+   スを終了します。child_life_timeやconnection_life_timeが効かないくら
+   い忙しいサーバで、PostgreSQLバックエンドが肥大化するのを防ぐのに有
+   効です。
+
+   logdir
+
+   pgpoolの各種ログファイルを格納するディレクトリです．現在のところ，
+   pgpool.pidというプロセスIDを格納するファイルだけが作られるようになっ
+   ています．logdirのデフォルト値は'/tmp'です．
+
+   replication_mode
+
+   レプリケーションモードで動作させる場合はtrueを指定してください．デ
+   フォルト値はfalseです．
+
+   replication_strict
+
+   このオプションをtrueにすると，masterの問い合わせ処理の完了を待って
+   からsecondaryの処理に移ります．デッドロックの危険性はなくなりますが，
+   masterとsecondaryの間で問い合わせの並列処理を行わなくなるので性能が
+   低下する場合もあります．
+
+   なお，すべての問い合わせではなくて，SQLのコメントを使って一部の問い
+   合わせのみstrict動作させることもできます．詳細は1.2を参照してくださ
+   い．
+
+   このオプションのデフォルト値はtrueです．
+
+   replication_timeout
+
+   replication_strictがfalseのときにデッドロックを監視するためのタイム
+   アウト時間をミリ秒単位で指定します．デフォルト値は5000，すなわち5秒
+   です．0を指定するとタイムアウトしなくなります．
+
+   load_balance_mode
+
+   trueを指定するとレプリケーションモードの際に，SELECT文をマスタとセ
+   カンダリの間でロードバランスします．デフォルト値はfalseです．
+
+   weight_master
+   weight_secondary
+
+   ロードバランスモードの時に，マスタとセカンダリにSELECTを振り分ける
+   「重み」を定義します．マスタとセカンダリのハードウェア性能に差があ
+   るときに有用です．
+
+   重みはweight_masterとweight_secondaryに設定された数値の比率で決定さ
+   れます．たとえば，
+
+   weight_master = 0.5
+   weight_secondary = 0.5
+
+   や
+
+   weight_master = 1
+   weight_secondary = 1
+
+   はいずれもマスタとセカンダリの重みが等しくなります（デフォルトです）．
+
+   weight_master = 1
+   weight_secondary = 0.5
+
+   ならマスタの方にはセカンダリの2倍の確率でSELECTが割り振られます．
+
+   weight_master = 1
+   weight_secondary = 0
+   
+   という設定も可能で，この場合はマスタだけにSELECTが割り振られるよう
+   になります．もちろん，INSERTなどの更新系の問い合わせはマスタとセカ
+   ンダリの両方に常に投げられます．
+
+   replication_stop_on_mismatch
+
+   trueを指定するとマスタとセカンダリの間でデータの不一致があった場合
+   に強制的に縮退運転に入ります．このオプションがfalseの場合は，該当の
+   問い合わせを強制的に終了するだけに留めます．デフォルト値はfalseです．
+
+   replicate_select
+
+   true を設定するとロードバランスされない SELECT 文をレプリケーション
+   させます。これは pgpool 3.2 までの挙動と同じになります。false を設
+   定すると SELECT 文をマスタのみに送信します。デフォルト値は false で
+   す。
+
+   reset_query_list
+
+   セッションが終了するときにコネクションを初期化するためのSQLコマンド
+   を「;」で区切って列挙します．デフォルトは以下のようになっていますが，
+   任意のSQL文を追加しても構いません．
+
+   reset_query_list = 'ABORT; RESET ALL; SET SESSION AUTHORIZATION DEFAULT'
+
+   PostgreSQLのバージョンによって使用できるSQLコマンドが違うので，
+   PostgreSQL 7.3以前では注意してください(「4. pgpoolの稼働環境」参照)．
+
+   なお，「ABORT」は，PostgreSQL 7.4以上ではトランザクションブロックの
+   中にいない場合には発行されません．
+
+   print_timestamp
+
+   trueならばpgpoolのログにタイムスタンプを追加します．デフォルトは
+   trueです．
+
+   master_slave_mode
+
+   trueならばマスタ/スレーブモードでpgpoolを運転します．詳細は14を見て
+   ください．デフォルトはfalseです．このモードはreplication_modeとは両
+   立しません．
+
+   connection_cache
+
+   trueならコネクションをキャッシュします．デフォルトはtrueです．
+
+   health_check_timeout
+
+   pgpoolはサーバ障害やネットワーク障害を検知するために，定期的にバッ
+   クエンドに接続を試みます．これを「ヘルスチェック」と言います．障害
+   が検知されると，フェイルオーバや縮退運転を試みます．
+
+   この パラメータは，ネットワークケーブルが抜けた際などにヘルスチェッ
+   クが長時間待たされるのを防ぐためのタイムアウト値を秒単位で指定しま
+   す．デフォルトは20秒です．0を指定するとタイムアウト処理をしません．
+
+   なお，ヘルスチェックを有効にすると，ヘルスチェックのための余分の接
+   続が1つ必要になりますので，PostgreSQLのpostgresql.confの設定項目の
+   max_connectionsを少くとも1増やすようにしてください．
+
+   health_check_period
+
+   ヘルスチェックを行う間隔を秒単位で指定します．0を指定するとヘルス
+   チェックを行いません．デフォルトは0です(つまりヘルスチェックを行い
+   ません)．
+
+   health_check_user
+
+   ヘルスチェックを行うためのPostgreSQLユーザ名です．
+
+   insert_lock
+
+   SERIAL型を使っているテーブルをレプリケーションすると，SERIAL型の列
+   の値がマスタとセカンダリで一致しなくなることがあります．この問題は，
+   該当テーブルを明示的にロックすることで回避できます(もちろんトランザ
+   クションの並列実行性は犠牲になりますが)．しかし，そのためには，
+
+   INSERT INTO ...
+
+   を
+
+   BEGIN;
+   LOCK TABLE ...
+   INSERT INTO ...
+   COMMIT;
+
+   に書き換えなければなりません．insert_lockをtrueにすると自動的にトラ
+   ンザクションの開始，テーブルロック，トランザクションの終了を行って
+   くれるので，こうした手間を省くことができます（すでにトランザクショ
+   ンが開始されている場合はLOCK TABLE...だけが実行されます）．
+
+   ただ，このテーブルで本当にSERIAL型が使われているかどうかが判定される
+   わけではないので，SERIAL型を使っていないテーブルでもこうした処理が
+   行われてしまいます（機能上支障があるわけではないのですが，処理速度
+   が遅くなってしまいます）．
+
+   この問題を回避するには2つの方法があります．
+
+   1) insert_lockをtrueにして，INSERT文の先頭に/*NO INSERT LOCK*/コメ
+      ントを追加する．このコメントがあると，テーブルロックは行われませ
+      ん．
+
+   2) insert_lockをfalseにして，INSERT文の先頭に/*INSERT LOCK*/コメン
+      トを追加する．このコメントがあると，このINSERT文に対してのみテー
+      ブルロックが行われます．
+
+   SERIAL型を使っているテーブルが多い場合は1)を，少ない場合は2)を採用
+   すると良いでしょう．
+
+   insert_lockのデフォルト値はfalseです．
+
+   なお，insert_lockを有効にしてregression testを実行すると，少くとも
+   PostgreSQL 8.0ではtransactions, privileges, rules, alter_tableが
+   failします．ruleでは，viewに対してLOCKをしようとしてしまうこと，
+   ほかのものは
+
+   ! ERROR:  current transaction is aborted, commands ignored until end of transaction block
+
+   というようなメッセージが出てしまうためです．たとえば，transactions 
+   では，存在しないテーブルに対してINSERTを行うテストが含まれており，
+   pgpoolが最初に存在しないテーブルに対してLOCKを行う結果，エラーになっ
+   てトランザクションがアボート状態になり，続くINSERTで上記エラーが出
+   てしまいます．
+
+   ignore_leading_white_space
+
+   trueならば、load balanceの際にSQL文行頭の空白を無視します(全角ス
+   ペースは無視されません)。これは、DBI/DBD:Pgのように、勝手に行頭にホ
+   ワイトスペースを追加するようなAPIを使い、ロードバランスしたいときに
+   有効です。
+
+   log_statement
+
+   trueならばSQL文をログ出力します．この役目はPostgreSQLの
+   log_statementオプションと似ていて，デバッグオプションがないときでも
+   問い合わせをログ出力して調べることができるので便利です．
+
+   log_connections
+
+   trueならば、全てのクライアント接続をログへ出力します。
+
+   log_hostname
+
+   trueならば，psコマンドでの状態表示時にIPアドレスではなく，ホスト名
+   を表示します．また，log_connectionsが有効な場合にはログにホスト名を
+   出力します．
+
+   enable_pool_hba
+
+   trueならば、pool_hba.confに従ってクライアント認証を行います。
+   詳細は「7. クライアント認証(HBA)のためのpool_hba.conf設定方法」を参
+   照してください。
+
+7. クライアント認証(HBA)のための pool_hba.conf 設定方法
+
+   PostgreSQLのpg_hba.confと同じようにpgpoolでもpool_config.confファイ
+   ルを使ったクライアント認証がサポートされています。
+
+   pgpoolをインストールするとデフォルトインストール先の設定ファイルディ
+   レクトリ"/usr/local/etc"にpool_hba.conf.sampleが一緒にインストール
+   されます。
+
+   このpool_hba.conf.sampleファイルをpool_hba.confとしてコピーし、必要
+   であれば編集してください。デフォルトではpool_hbaによる認証は有効に
+   なっています。
+
+   pool_hba.confのフォーマットはpg_hba.confのものとほとんど同じです。
+
+     local      DATABASE  USER  METHOD  [OPTION]
+     host       DATABASE  USER  CIDR-ADDRESS  METHOD  [OPTION]
+
+   各フィールドで設定できる値の詳細は"pool_hba.conf.sample"を参照して
+   ください。
+
+   以下はpool_hbaの制限事項です。
+
+   * "hostssl"接続タイプはサポートされません
+
+     現在pgpoolはSSL接続をサポートしていないので"hostssl"は指定するこ
+     とができません。
+
+   * DATABASEフィールド値として"samegroup"はサポートされません
+
+     pgpoolはバックエンドサーバにあるユーザ情報を事前に知る事ができな
+     いため、データベース名はpool_hba.confにある値のみと比較されます。
+     なのでグループに関する認証はpool_hbaで行うことができません。
+
+   * USERフィールド値として"+"を使ったグループ指定はサポートされません
+
+     上記の"samegroup"と同じ理由で、ユーザ名はpool_hba.confにある値の
+     みと比較されます。グループに関する認証はpool_hbaで行うことはでき
+     ません。
+
+   * IPv6アドレス/マスク表記法はサポートされません
+
+     現在pgpoolはIPv6をサポートしていません。
+
+   * "trust", "reject", "pam"以外のメソッドはサポートされません
+
+     これも上記の"samegroup"と同じ理由によるものです。pgpoolはバックエ
+     ンドのユーザ/パスワード情報を持っていないので、バックエンドに保存
+     されているパスワードを使った認証を行うことができません。
+
+   ここで説明された機能、制限はクライアントとpgpool間で行われるクライ
+   アント認証についてだということに注意してください。クラインアントは
+   pgpoolのクライアント認証に成功したとしても、PostgreSQLによるクライ
+   アント認証に成功しないと接続状態となりません。pool_hbaにとってはク
+   ライアントに指定されたユーザ名やデータベース名
+   (例. psql -U testuser testdb)が実際にバックエンド上に存在するかどう
+   かは問題ではありません。それがpool_hba.confの値とマッチするかどうか
+   でチェックが行われます。
+
+   pgpoolが稼働するホスト上のユーザ情報を使ったPAM認証を利用することが
+   できます。pgpoolをPAMサポート付きでビルドするにはconfigureオプショ
+   ンに"--with-pam"を指定してください。
+
+     ./configure --with-pam
+
+   実際にPAM認証を有効にするには、pool_hba.confで"pam"メソッドを設定す
+   るのに加え、pgpoolのサービス設定ファイルをシステムのPAM設定ディレクト
+   リ（通常は /etc/pam.d に作成する必要があります。サービス設定ファイ
+   ルの例はインストールディレクトリの"share/pgpool.pam"を参考にしてく
+   ださい。
+
+8. pgpoolの起動
+
+   pgpoolを起動するもっとも簡単な方法は，
+
+   $ pgpool
+
+   とするだけです．これで/usr/local/etc/pgpool.confを読み込み，その設
+   定でサーバを起動します．
+
+   指定可能なオプションは次の通りです．
+
+   -f path
+
+   デフォルト以外のコンフィギュレーションファイルのパス名を指定します．
+
+   -a path
+
+   デフォルト以外のHBAコンフィギュレーションファイルのパス名を指定します．
+
+   -n
+
+   デーモンモードで起動しません．このオプションはloggerやrotatelogsな
+   どを使ってエラーメッセージをファイルに出力するときなどに便利です．
+
+   -d
+
+   デバッグメッセージを大量に出力します．
+
+   -h
+
+   ヘルプメッセージを出力して終了します．
+
+9. pgpoolの終了
+
+   「stop」オプションを使います．
+
+   $ pgpool [-f path_to_configuration_file][-m {s[mart]|f[ast]|i[mmediate]}] stop
+
+   で停止できます．起動時に-fオプションで設定ファイルをしているときは，
+   stop時にも-fオプションで設定ファイルを指定してください．
+
+   まだフロントエンドからの接続が終了していない子プロセスがあると，
+   pgpoolは終了せずにその接続が終了するのを待ちます．stopリクエストが
+   発行された以後は，新たにクライアントはpgpoolに接続することはできま
+   せん．
+
+   待たずに強制的に終了させるには，以下のようにします．
+
+   $ pgpool -m fast stop
+
+   または
+
+   $ pgpool -m immediate stop
+
+   fastは"f"，immediateは"i"と省略することもできます．ちなみに，
+
+   $ pgpool -m smart stop
+
+   または
+
+   $ pgpool -m s stop
+
+   とすると，pgpool stopと同じ動作をします．
+
+10. スイッチオーバ
+
+   メインテナンスなどのために意図的にフェイルオーバや縮退運転モードに
+   移行することができます．
+
+   $ pgpool [-f config_file] [-s {m[aster]|s[econdary]] switch
+
+   -sオプションを省略すると，マスタ側を落とし，セカンダリにフェイルオー
+    バ(コネクションプールモードで動作時)または縮退(レプリケーションモー
+    ドで動作時)します．セカンダリを落としたい場合は，
+
+   $ pgpool [-f config_file] -s s[econdary] switch
+
+   とします．
+
+   なお，PostgreSQLサーバが1台の状態で動いている場合は，現在のクライア
+   ントからpgpoolへのコネクションを強制的に一度切断し，pgpoolの子プロ
+   セスが再起動されます．
+
+11. ログの取り方
+
+   pgpoolを-nオプション付で起動すると，stderr(標準エラー出力)にエラー
+   や重大な情報(たとえばフェイルオーバしたような場合)に関するメッセー
+   ジが出力されます．このままファイルにリダイレクトすることにより，
+   pgpoolのログを取ることができます．
+
+   [実行例]
+
+   pgpool -n >& /tmp/pgpool.log &
+   または
+   pgpool -n > /tmp/pgpool.log 2>&1 &
+
+   このとき，print_timestampをtrueにしておくと，タイムスタンプがログに
+   付加されます(print_timestampはデフォルトでtrueです)．
+
+   また，loggerコマンドを使ってsyslogにメッセージを出力するのもよい方
+   法です．
+
+   [実行例]
+
+   pgpool -n 2>&1 |logger -t pgpool -p local0.info&
+
+   これにより，以下のようなメッセージがsyslogに出力されます．
+
+   Apr 13 15:07:11 srapc1977  4月 13 15:07:11 pgpool: log: pid 2038: starting failover from (5432) to (5433)
+   Apr 13 15:07:11 srapc1977  4月 13 15:07:11 pgpool: log: pid 2038: failover from (5432) to (5433) done.
+
+
+12. pgpoolの内部情報の取得
+
+    pgpoolが認識している設定ファイル(pgpool.conf)の内容や，現在のレプ
+    リケーションの状態をSQLを発行することによって取得することができま
+    す．たとえば，今pgpoolが同じホストのポート9999で動いているとすると，
+    以下のようにして情報を取得できます．
+
+    psql -p 9999 -c 'show pool_status' template1
+
+    (データベース名は何でもかまいません)．
+
+             item             |                        value                         |                              description                                                   --------------------------------+------------------------------------------------------+------------------------------------------------------------------------
+ listen_addresses             | *                                                    | host name(s) or IP address(es) to listen to
+ port                         | 9998                                                 | pgpool accepting port number
+ socket_dir                   | /tmp                                                 | pgpool socket directory
+ backend_host_name            |                                                      | master backend host name
+ backend_port                 | 5432                                                 | master backend port number
+ secondary_backend_host_name  |                                                      | secondary backend host name
+ secondary_backend_port       | 5433                                                 | secondary backend port number
+ num_init_children            | 32                                                   | # of children initially pre-forked
+ child_life_time              | 0                                                    | if idle for this seconds, child exits
+ connection_life_time         | 0                                                    | if idle for this seconds, connection closes
+ child_max_connections        | 0                                                    | if max_connections received, chile exits
+ max_pool                     | 2                                                    | max # of connection pool per child
+ logdir                       | /tmp                                                 | logging directory
+ backend_socket_dir           | /tmp                                                 | Unix domain socket directory for the PostgreSQL server
+ replication_mode             | 1                                                    | non 0 if operating in replication mode
+ replication_strict           | 1                                                    | non 0 if operating in strict mode
+ replication_timeout          | 5000                                                 | if secondary does not respond in this milli seconds, abort the session
+ load_balance_mode            | 0                                                    | non 0 if operating in load balancing mode
+ weight_master                | 1.000000                                             | weight of master
+ weight_secondary             | 1.000000                                             | weight of secondary
+ replication_stop_on_mismatch | 0                                                    | stop replication mode on fatal error
+ reset_query_list             | ABORT; RESET ALL; SET SESSION AUTHORIZATION DEFAULT; | queries issued at the end of session
+ print_timestamp              | 1                                                    | if true print time stamp to each log line
+ master_slave_mode            | 0                                                    | if true, operate in master/slave mode
+ connection_cache             | 1                                                    | if true, cache connection pool
+ health_check_timeout         | 5                                                    | health check timeout
+ health_check_period          | 0                                                    | health check period
+ health_check_user            | t-ishii                                              | health check user
+ insert_lock                  | 1                                                    | insert lock
+ ignore_leading_white_space   | 0                                                    | ignore leading white spaces
+ current_backend_host_name    |                                                      | current master host name
+ current_backend_port         | 5432                                                 | current master port #
+ replication_enabled          | 1                                                    | non 0 if actually operating in replication mode
+ master_slave_enabled         | 0                                                    | non 0 if actually operating in master/slave
+ num_reset_queries            | 3                                                    | number of queries in reset_query_list
+ log_statement                | 0                                                    | if true, print all statements to the log
+ log_connections              | 1                                                    | if true, print incoming connections to the log
+ log_hostname                 | 0                                                    | if true, resolve hostname for ps and log print
+ enable_pool_hba              | 1                                                    | if true, use pool_hba.conf for client authentication
+ server_status                | master( on 5432) up secondary( on 5433) up           | server status
+(39 rows)
+
+contrib/dblinkを使えば，以下のようにして一部の結果だけを見ることができ
+ます．
+
+test=# SELECT * FROM dblink('port=9999 dbname=test', 'show pool_status')
+	AS c1(pname text, val text) WHERE pname = 'port';
+ pname | val  
+-------+------
+ port  | 9999
+(1 row)
+
+13. regression testの実施
+
+   以下のようにしてpgpoolを併用してregression testを行うことができます．
+
+   $ cd /usr/local/src/postgresql-7.4.5/src/test/regress
+   $ make all
+   $ ./pg_regress --schedule=parallel_schedule --port=9999
+
+   注意: PostgreSQL 8.0では，src/test/regress以下にテスト用のテーブル
+   スペースを作るため，同じホスト上に2つのデータベースクラスタを作り，
+   レプリケーションモードでregression testをすると必ずtablespaceのテス
+   トがfailしますが，これは異常ではありません．
+
+14. ベンチマークの実施
+
+   ベンチマークを実施するにはいろいろな方法がありますが，ここでは
+   pgbenchとPHPそれにabを使った簡単な方法をご紹介します．
+
+   まず，ベンチマークデータベースを初期化します．
+
+   $ pgbench -i test
+  
+   abを起動します．ターゲットとなるPHPスクリプトはここでは以下のような
+   簡単なものを使います．
+
+   <?php
+    ini_set("track_errors", "1");
+    define_syslog_variables();
+
+    $con = pg_connect("dbname=test user=postgres port=9999");
+    if ($con == FALSE) {
+      syslog(LOG_ERR, "could not connect $php_errormsg");
+      trigger_error("Could not connect to DB", E_USER_ERROR);
+      exit(1);
+    }
+    $aid = rand(1,10000);
+    pg_query($con, "SELECT * FROM accounts WHERE aid = $aid");
+    pg_close($con);
+  ?>
+
+  $ /usr/local/apache/bin/ab -c 100 -n 1000 "http://localhost/bench.php"
+
+15. master/slaveモード
+
+  master/slaveモードは，Slony-Iのような，master/slave式のレプリケーショ
+  ンソフトにレプリケーションをまかせるモードです．このモードで使うために
+  は，レプリケーションモードと同じように，マスタとセカンダリのホスト情報
+  をセットし，master_slave_modeとload_balance_modeをtrueにします．このと
+  き，問い合わせによってマスタだけに問い合わせが送られる場合と，マスタと
+  セカンダリのどちらかにロードバランスされて問い合わせが送られる場合があ
+  ります．
+
+  1) 以下の条件がすべて満たされている場合，問い合わせはマスタとセカンダ
+    リに負荷分散されます．
+
+     - PostgreSQLのバージョンが7.4以降	
+     - 問い合わせが正確に"SELECT"(大文字/小文字の別は無視されます)で始まっ
+       ている
+     - 問い合わせが明示的なトランクザションブロックの内側にない(つまり，
+       BEGINを発行していない)
+
+  2) 1)以外の場合は，マスタだけに問い合わせが送られます．
+
+16. 複数のpgpoolを同じホストで立ち上げるには
+
+  複数のpgpoolを同じホストで立ち上げるには(たとえば2つのDBクラスタを別々
+  にpgpoolで扱うケース)，2つの設定ファイルを作ります．
+
+  それぞれのpgpoolを-fオプション付で起動し，それぞれの設定ファイルを認
+  識させます．例:
+
+  pgpool -f /usr/local/etc/pgpool.1.conf
+  pgpool -f /usr/local/etc/pgpool.2.conf
+
+  なお，2つの設定ファイルでは以下のパラメータを別々の値にする必要があ
+  ります．
+
+  port
+  logdir (pgpoolのpidファイルの置き場所)
+
+  なお，pgpoolを停止する際にも-fオプションを使います．例：
+
+  pgpool -f /usr/local/etc/pgpool.1.conf -m smart stop
+
+  このコマンドによって，上の例の最初のpgpoolが停止します．
