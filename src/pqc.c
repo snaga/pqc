@@ -3,6 +3,7 @@
  *
  * Copyright(C) 2010 Uptime Technologies, LLC.
  */
+#include <ctype.h>
 #include <stdio.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -240,7 +241,7 @@ encode_key(const char *s, char *buf, size_t buflen)
     if (i>=buflen)
       break;
 
-    if ( s[i]==' ' )
+    if ( s[i]==' ' || iscntrl(s[i]) )
       buf[i] = '_';
     else
       buf[i] = s[i];
