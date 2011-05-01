@@ -21,7 +21,8 @@ static memcached_return rc;
 static char cache_key[PQC_MAX_KEY];
 
 static size_t buflen = 0;
-static char buf[PQC_MAX_VALUE];
+static size_t bufsize = 0;
+static char *buf = NULL;
 
 static int pqc_start_memcached(int);
 static char *encode_key(const char *, char *, size_t);
@@ -193,7 +194,11 @@ void
 pqc_buf_init(void)
 {
   buflen = 0;
-  memset(buf, 0, sizeof(buf));
+  if (buf == NULL) {
+    bufsize = PQC_MAX_VALUE;
+    buf = (char *)malloc(bufsize);
+  }
+  memset(buf, 0, bufsize);
 }
 
 int
@@ -204,13 +209,22 @@ pqc_buf_add(const char *s, size_t len)
   if ( !IsQueryCacheEnabled )
     return 0;
 
+  // Check if we need to increase the buffer size
+  if (buflen + len >= bufsize) {
+    // Allocate enough memory to complete the copy plus PQC_MAX_VALUE buffer space
+    size_t newbufsize = (buflen + len) + PQC_MAX_VALUE;
+    pool_debug("pqc_buf_add: realloc buf bufsize=%d newbufsize=%d", bufsize, newbufsize);
+    bufsize = newbufsize;
+    buf = (char *)realloc(buf, bufsize);
+  }
+
   for (pos=0 ; pos<len ; pos++)
   {
     buf[buflen+pos] = s[pos];
   }
   buflen += pos;
 
-  pool_debug("pqc_buf_add: len=%d, total=%d", len, buflen);
+  pool_debug("pqc_buf_add: len=%d, total=%d bufsize=%d", len, buflen, bufsize);
 
   return buflen;
 }
