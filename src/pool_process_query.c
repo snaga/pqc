@@ -478,7 +478,7 @@ POOL_STATUS pool_process_query(POOL_CONNECTION *frontend,
 						char *current_query;
 						current_query = pqc_pop_current_query();
 
-						if ( current_query )
+						if ( current_query && pqc_buf_len()>0 && pqc_buf_get()!=NULL )
 							pqc_set_cache(frontend, current_query, pqc_buf_get(), pqc_buf_len());
 					}
 

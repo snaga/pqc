@@ -25,6 +25,7 @@ static size_t bufsize = 0;
 static char *buf = NULL;
 
 static int pqc_start_memcached(int);
+static int pqc_stop_memcached();
 static char *encode_key(const char *, char *, size_t);
 
 /*
@@ -209,10 +210,27 @@ pqc_buf_add(const char *s, size_t len)
   if ( !IsQueryCacheEnabled )
     return 0;
 
+  /* the buffer is exceeded, and disabled. */
+  if ( buf==NULL || buflen<0 )
+    return 0;
+
+  /*
+   * If a buffer size is exceeded, free the buffer and set -1 to its length
+   * to disable the buffer.
+   */
+  if ( buflen + len >= PQC_MAX_CACHELEN )
+  {
+    pool_log("The result set too large to store into the cache. (len=%d)", buflen+len);
+    free(buf);
+    buf = NULL;
+    buflen = -1;
+    return 0;
+  }
+
   // Check if we need to increase the buffer size
   if (buflen + len >= bufsize) {
     // Allocate enough memory to complete the copy plus PQC_MAX_VALUE buffer space
-    size_t newbufsize = (buflen + len) + PQC_MAX_VALUE;
+    size_t newbufsize = ( (buflen + len) / PQC_MAX_VALUE + 1 ) * PQC_MAX_VALUE;
     pool_debug("pqc_buf_add: realloc buf bufsize=%d newbufsize=%d", bufsize, newbufsize);
     bufsize = newbufsize;
     buf = (char *)realloc(buf, bufsize);
